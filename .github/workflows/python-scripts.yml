@@ -1,36 +1,214 @@
-# This is a basic workflow to help you get started with Actions
+import os
+from selenium.webdriver.common.by import By
+from bs4 import BeautifulSoup
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.action_chains import ActionChains
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from webdriver_manager.chrome import ChromeDriverManager
+from selenium import webdriver
+import csv
+import time
 
-name: CI
 
-# Controls when the workflow will run
-on:
-  # Triggers the workflow on push or pull request events but only for the "main" branch
-  push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
+def collect_subcategories_from_category(driver, category_url, parent_name="Root"):
+    """
+    Klikne na hlavní kategorii a prochází její podkategorie.
+    """
+    collected_categories = []
 
-  # Allows you to run this workflow manually from the Actions tab
-  workflow_dispatch:
+    # Navigace na hlavní kategorii
+    driver.get(category_url)
+    time.sleep(0.5)
 
-# A workflow run is made up of one or more jobs that can run sequentially or in parallel
-jobs:
-  # This workflow contains a single job called "build"
-  build:
-    # The type of runner that the job will run on
-    runs-on: ubuntu-latest
+    # Rekurzivní sběr podkategorií
+    def collect_subcategories(parent_element=None, parent_name=None):
+        try:
+            subcategories = driver.find_elements(By.CSS_SELECTOR, "ul.active.expanded li > a")
+            for subcategory in subcategories:
+                try:
+                    # Získání URL a názvu podkategorie
+                    category_name = subcategory.text.strip()
+                    category_url = subcategory.get_attribute("href")
 
-    # Steps represent a sequence of tasks that will be executed as part of the job
-    steps:
-      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
-      - uses: actions/checkout@v4
+                    # Kontrola, jestli už kategorie nebyla zpracována
+                    if category_url not in [cat["url"] for cat in collected_categories]:
+                        collected_categories.append({"name": category_name, "url": category_url, "parent": parent_name})
+                        print(f"Nalezena kategorie: {category_name} - {category_url}")
 
-      # Runs a single command using the runners shell
-      - name: Run a one-line script
-        run: echo Hello, world!
+                        # Kliknout na podkategorii a zpracovat její podkategorie
+                        driver.execute_script("arguments[0].click();", subcategory)
+                        time.sleep(0.2)
 
-      # Runs a set of commands using the runners shell
-      - name: Run a multi-line script
-        run: |
-          echo Add other actions to build,
-          echo test, and deploy your project.
+                        # Rekurzivně sbírat další podkategorie
+                        collect_subcategories(driver.find_element(By.CSS_SELECTOR, "ul.active.expanded"), category_name)
+
+                except Exception as e:
+                    print(f"Chyba při zpracování podkategorie: {e}")
+                    if "stale element reference" in str(e):
+                        print("Chyba: stale element reference. Ukončuji zpracování této kategorie.")
+                        return  # Přeskočí zbytek aktuální kategorie
+        except Exception as e:
+            print(f"Chyba při získávání podkategorií: {e}")
+            if "stale element reference" in str(e):
+                print("Chyba: stale element reference. Ukončuji zpracování této kategorie.")
+                return  # Přeskočí zbytek aktuální kategorie
+
+    # Najít první úroveň podkategorií
+    try:
+        parent_element = driver.find_element(By.CSS_SELECTOR, "ul.active.expanded")
+        collect_subcategories(parent_element, parent_name)
+    except Exception as e:
+        print(f"Chyba při zpracování hlavní kategorie: {e}")
+        return  # Ukončí aktuální kategorii
+
+    return collected_categories
+
+
+def collect_products_from_category(driver, category_url):
+    """
+    Získá všechny produkty z dané URL kategorie pomocí BeautifulSoup.
+    """
+    print(f"Otevírám kategorii: {category_url}")
+    driver.get(category_url)
+    time.sleep(1)
+
+    products = []
+
+    try:
+        soup = BeautifulSoup(driver.page_source, "html.parser")
+        product_elements = soup.find_all("div", class_="p", attrs={"data-micro": "product"})
+
+        for product in product_elements:
+            try:
+                # Název produktu
+                name_tag = product.find("span", attrs={"data-testid": "productCardName"})
+                product_name = name_tag.text.strip() if name_tag else "N/A"
+
+                # SKU produktu
+                sku_tag = product.find("span", class_="no-display", attrs={"data-micro": "sku"})
+                product_sku = sku_tag.text.strip() if sku_tag else "N/A"
+
+                # Cena produktu
+                price_tag = product.find("div", class_="price price-final")
+                if price_tag:
+                    price_text = price_tag.find("strong").text.strip()
+                    product_price = price_text.replace("Kč", "").replace(",", "").replace(" ", "").replace("od", "").strip()
+                else:
+                    product_price = "N/A"
+
+                # Kategorie
+                category_tag = soup.find('h1')
+                category_name = category_tag.text.strip() if category_tag else "Neznámá kategorie"    
+
+                # Skladovost
+                stock_status = "skladem"
+
+                # Ukládání produktu
+                products.append({
+                    "name": product_name,
+                    "sku": product_sku,
+                    "category": category_name,
+                    "price-B2C": int(product_price) if product_price != "N/A" else product_price,
+                    "stock": stock_status
+                })
+
+                print(f"{product_sku}, {product_name}, {category_name}, {product_price}, {stock_status}")
+
+            except Exception as e:
+                print(f"Chyba při zpracování produktu: {e}")
+
+    except Exception as e:
+        print(f"Chyba při získávání produktů z kategorie {category_url}: {e}")
+
+    return products
+
+
+def save_to_csv(file_name, data):
+    try:
+        # Vytvoření slovníku pro odstranění duplicitních SKU
+        unique_data_dict = {}
+        for row in data:
+            sku = row[0]  # Předpokládá se, že SKU je první sloupec
+            if sku not in unique_data_dict:
+                unique_data_dict[sku] = row  # Zachovat první výskyt SKU
+
+        # Převedení unikátních hodnot zpět na seznam
+        unique_data = list(unique_data_dict.values())
+
+        # Seřazení dat podle SKU
+        sorted_data = sorted(unique_data, key=lambda x: x[0])
+
+        # Kontrola, zda složka pro soubor existuje
+        os.makedirs(os.path.dirname(file_name), exist_ok=True)
+
+        # Uložení dat do CSV souboru
+        with open(file_name, mode='w', encoding='utf-8', newline='') as csv_file:
+            writer = csv.writer(csv_file)
+            writer.writerow(["SKU", "Name", "Category", "Price-B2C", "Stock"])  # Hlavička CSV
+            writer.writerows(sorted_data)
+
+        print(f"Data byla uložena do souboru {file_name}.")
+    except Exception as e:
+        print(f"Chyba při ukládání do CSV: {e}")
+
+
+if __name__ == "__main__":
+    # Hlavní kategorie, které chceme prohledat
+    main_categories = [
+        "https://www.jablecnedily.cz/iphone/"
+    ]
+
+    output_file = "Export_CSV/JablecneDily-B2C.csv"
+
+    # Nastavení prohlížeče Chrome
+    options = Options()
+    options.add_argument("--headless")  # Hlavní úprava: přidání headless režimu
+    options.add_argument("--disable-notifications")
+    options.add_argument("--start-maximized")
+    service = Service(ChromeDriverManager().install())
+    driver = webdriver.Chrome(service=service, options=options)
+
+    try:
+        all_categories = []
+        all_products = []  # Inicializace seznamu pro produkty
+
+        for category_url in main_categories:
+            print(f"Procházím hlavní kategorii: {category_url}")
+            categories = collect_subcategories_from_category(driver, category_url)
+            if categories:
+                all_categories.extend(categories)
+
+        print("\nSeznam kategorií:")
+        for category in all_categories:
+            print(f"{category['name']} - {category['url']}")
+
+        print("Prohledávání dokončeno. Pokračujeme ve vytěžování produktů...\n")
+
+        # Vytěžování produktů z každé kategorie
+        for category in all_categories:
+            category_name = category["name"]
+            category_url = category["url"]
+            print(f"Zpracovávám produkty v kategorii: {category_name}")
+
+            products = collect_products_from_category(driver, category_url)
+            for product in products:
+                all_products.append([
+                    product["sku"],
+                    product["name"],
+                    product["category"],  # Správná hodnota kategorie
+                    product["price-B2C"],  # Opravený název klíče
+                    product["stock"]
+                ])
+
+        # Ukládání dat do CSV
+        save_to_csv(output_file, all_products)
+
+        print(f"Data byla uložena do souboru {output_file}.")
+
+    except Exception as e:
+        print(f"Chyba během zpracování: {e}")
+
+    finally:
+        driver.quit()
